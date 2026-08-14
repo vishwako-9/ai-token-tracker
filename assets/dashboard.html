@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tokentracker</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+    background: #0d1117; color: #e6edf3; padding: 24px;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  h1 span { color: #58a6ff; }
+  .sub { color: #8b949e; font-size: 12px; margin-bottom: 20px; }
+  .controls { display: flex; gap: 12px; align-items: center; margin-bottom: 16px; flex-wrap: wrap; }
+  .controls label { color: #8b949e; font-size: 12px; }
+  select, button {
+    background: #161b22; color: #e6edf3; border: 1px solid #30363d;
+    padding: 6px 10px; border-radius: 6px; font: inherit; font-size: 12px; cursor: pointer;
+  }
+  button { background: #238636; border-color: #2ea043; }
+  button:hover { background: #2ea043; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 24px; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 14px 16px; }
+  .card .label { color: #8b949e; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
+  .card .value { font-size: 22px; font-weight: 600; margin-top: 4px; }
+  .card .value.cost { color: #d29922; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; background: #161b22; border-radius: 8px; overflow: hidden; }
+  th, td { padding: 8px 12px; text-align: right; border-bottom: 1px solid #21262d; }
+  th { color: #8b949e; font-weight: 500; text-transform: uppercase; font-size: 11px; }
+  td:first-child, th:first-child { text-align: left; }
+  tbody tr:hover { background: #1c2128; }
+  .section { margin-bottom: 28px; }
+  .section h2 { font-size: 14px; color: #58a6ff; margin: 0 0 10px; }
+  canvas { background: #161b22; border: 1px solid #30363d; border-radius: 8px; }
+  .err { color: #f85149; }
+</style>
+</head>
+<body>
+  <h1>tokentracker <span>dashboard</span></h1>
+  <div class="sub">Local AI coding token usage &amp; cost — data from <code>~/.config/tokentracker/tokentracker.db</code></div>
+
+  <div class="controls">
+    <label>Range</label>
+    <select id="range">
+      <option value="7">7 days</option>
+      <option value="30" selected>30 days</option>
+      <option value="90">90 days</option>
+      <option value="365">1 year</option>
+    </select>
+    <button id="refresh">Refresh</button>
+    <span class="sub" id="updated"></span>
+  </div>
+
+  <div class="cards">
+    <div class="card"><div class="label">Total input tokens</div><div class="value" id="c-input">–</div></div>
+    <div class="card"><div class="label">Total output tokens</div><div class="value" id="c-output">–</div></div>
+    <div class="card"><div class="label">Cache read</div><div class="value" id="c-cache">–</div></div>
+    <div class="card"><div class="label">Estimated cost</div><div class="value cost" id="c-cost">–</div></div>
+  </div>
+
+  <div class="section">
+    <h2>Daily usage</h2>
+    <canvas id="chart" height="220"></canvas>
+  </div>
+
+  <div class="section">
+    <h2>By model</h2>
+    <table>
+      <thead><tr><th>Provider</th><th>Model</th><th>Input</th><th>Output</th><th>Cache read</th><th>Cache write</th><th>Cost</th><th>Records</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const fmtInt = (n) => n == null ? "–" : Number(n).toLocaleString("en-US");
+const fmtCost = (n) => n == null || n === 0 ? "0" : (n < 0.01 ? "$" + n.toFixed(4) : "$" + n.toFixed(2));
+
+async function refresh() {
+  const days = $("range").value;
+  try {
+    const [usage, daily] = await Promise.all([
+      fetch("/api/usage?days=" + days).then((r) => r.json()),
+      fetch("/api/daily?days=" + days).then((r) => r.json()),
+    ]);
+
+    const rows = usage.rows || [];
+    const sum = (f) => rows.reduce((a, r) => a + (f(r) || 0), 0);
+    $("c-input").textContent = fmtInt(sum((r) => r.total_input));
+    $("c-output").textContent = fmtInt(sum((r) => r.total_output));
+    $("c-cache").textContent = fmtInt(sum((r) => r.total_cache_read));
+    $("c-cost").textContent = fmtCost(sum((r) => r.total_cost));
+
+    const tbody = $("rows");
+    tbody.innerHTML = "";
+    if (!rows.length) {
+      tbody.innerHTML = '<tr><td colspan="8">No usage found for this period. Run `tokentracker sync` first.</td></tr>';
+    }
+    for (const r of rows) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `<td>${r.provider}</td><td>${r.model}</td>
+        <td>${fmtInt(r.total_input)}</td><td>${fmtInt(r.total_output)}</td>
+        <td>${fmtInt(r.total_cache_read)}</td><td>${fmtInt(r.total_cache_write)}</td>
+        <td>${fmtCost(r.total_cost)}</td><td>${fmtInt(r.record_count)}</td>`;
+      tbody.appendChild(tr);
+    }
+
+    drawChart(daily.rows || []);
+    $("updated").textContent = "updated " + new Date().toLocaleTimeString();
+  } catch (e) {
+    $("rows").innerHTML = '<tr><td colspan="8" class="err">Error: ' + e.message + '</td></tr>';
+  }
+}
+
+function drawChart(rows) {
+  const canvas = $("chart");
+  const dpr = window.devicePixelRatio || 1;
+  const ctx = canvas.getContext("2d");
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  canvas.width = w * dpr; canvas.height = h * dpr;
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, w, h);
+
+  const pad = { l: 70, r: 12, t: 12, b: 30 };
+  const cw = w - pad.l - pad.r, ch = h - pad.t - pad.b;
+  const maxIn = Math.max(1, ...rows.map((r) => r.total_input || 0));
+  const maxOut = Math.max(1, ...rows.map((r) => r.total_output || 0));
+  const max = Math.max(maxIn, maxOut);
+  const barW = Math.min(24, (cw / Math.max(rows.length, 1)) * 0.55);
+  const gap = (cw / Math.max(rows.length, 1));
+  const step = max / 4;
+
+  // grid
+  ctx.strokeStyle = "#21262d"; ctx.fillStyle = "#8b949e"; ctx.font = "10px monospace";
+  for (let i = 0; i <= 4; i++) {
+    const y = pad.t + ch - (ch * i) / 4;
+    ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(w - pad.r, y); ctx.stroke();
+    ctx.fillText(fmtInt(max * i / 4), 4, y + 3);
+  }
+
+  rows.forEach((r, i) => {
+    const x = pad.l + i * gap + (gap - barW) / 2;
+    const hi = (r.total_input || 0) / max * ch;
+    const ho = (r.total_output || 0) / max * ch;
+    ctx.fillStyle = "#58a6ff";
+    ctx.fillRect(x, pad.t + ch - hi, barW / 2 - 1, hi);
+    ctx.fillStyle = "#3fb950";
+    ctx.fillRect(x + barW / 2, pad.t + ch - ho, barW / 2 - 1, ho);
+    ctx.fillStyle = "#8b949e";
+    ctx.fillText(r.date.slice(5), x, pad.t + ch + 14);
+  });
+
+  ctx.fillStyle = "#8b949e";
+  ctx.fillText("in (blue) / out (green)", pad.l, 10);
+}
+
+$("refresh").addEventListener("click", refresh);
+$("range").addEventListener("change", refresh);
+refresh();
+</script>
+</body>
+</html>
