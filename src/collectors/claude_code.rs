@@ -35,7 +35,11 @@ struct LogEntry {
     message: Option<MessageData>,
     #[serde(default)]
     timestamp: Option<String>,
-    #[serde(default, alias = "sessionId")]
+    // Newer logs carry both `session_id` and `sessionId` keys in the same
+    // line; serde treats an alias as a duplicate field when both are present.
+    // Read the canonical `sessionId` key and let `session_id` be ignored as
+    // an unknown field.
+    #[serde(default, rename = "sessionId")]
     session_id: Option<String>,
 }
 
@@ -211,6 +215,28 @@ mod tests {
         assert_eq!(r.cache_read_tokens, 2);
         assert_eq!(r.cache_write_tokens, 3);
         assert_eq!(r.session_id.as_deref(), Some("s1"));
+    }
+
+    #[test]
+    fn parses_lines_with_both_session_keys() {
+        // Newer Claude logs emit both `session_id` and `sessionId` in the same
+        // line. A serde alias on `session_id` used to collide and drop the
+        // entire line, so no July/August usage was ever collected.
+        let path = tempfile_path("claude-code-dual-session");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut w = std::io::BufWriter::new(file);
+        writeln!(
+            w,
+            r#"{{"type":"assistant","session_id":"s9","sessionId":"s9","timestamp":"2026-08-01T00:00:01Z","message":{{"model":"claude-sonnet-4","usage":{{"input_tokens":10,"output_tokens":5}}}}}}"#
+        )
+        .unwrap();
+        drop(w);
+
+        let recs = parse_jsonl_file(&path, "2026-08-01T00:00:02Z");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].session_id.as_deref(), Some("s9"));
     }
 
     #[test]
