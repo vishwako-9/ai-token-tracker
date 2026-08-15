@@ -99,4 +99,16 @@ impl Database {
     ) -> Result<Vec<crate::models::AntigravityRequest>> {
         queries::query_antigravity_requests(&self.conn, since)
     }
+
+    pub fn distinct_model_names(&self) -> Result<Vec<String>> {
+        queries::distinct_model_names(&self.conn)
+    }
+
+    pub fn pricing_overrides(&self) -> Result<Vec<crate::models::PricingOverride>> {
+        queries::pricing_overrides(&self.conn)
+    }
+
+    pub fn upsert_pricing_override(&self, ov: &crate::models::PricingOverride) -> Result<()> {
+        queries::upsert_pricing_override(&self.conn, ov)
+    }
 }

@@ -147,6 +147,29 @@ enum Commands {
     },
     /// Recompute cost for all records from current pricing
     Reprice,
+    /// Set a manual price override for a model that has appeared in usage
+    PriceSet {
+        /// Exact model name as recorded in usage data
+        model: String,
+        /// Input rate in $/million tokens
+        #[arg(long)]
+        input: f64,
+        /// Output rate in $/million tokens
+        #[arg(long)]
+        output: f64,
+        /// Cache read rate in $/million tokens
+        #[arg(long)]
+        cache_read: Option<f64>,
+        /// Cache write rate in $/million tokens
+        #[arg(long)]
+        cache_write: Option<f64>,
+    },
+    /// List manual price overrides, or show which models have no price at all
+    PriceList {
+        /// Show only models in usage data that currently have no price
+        #[arg(long)]
+        unpriced: bool,
+    },
     /// Count Antigravity requests per model/day (token usage unavailable)
     Antigravity {
         /// Number of days to look back (default: 30)
@@ -407,6 +430,138 @@ fn main() -> Result<()> {
                     "{}",
                     format!("Repriced {priced} records at current API list rates.").bold()
                 );
+            }
+            Commands::PriceSet { model, input, output, cache_read, cache_write } => {
+                use colored::Colorize;
+                let known = db.distinct_model_names()?;
+                if !known.contains(&model) {
+                    eprintln!("{}", format!("Unknown model: '{}'", model).red().bold());
+                    eprintln!(
+                        "{}",
+                        "price-set only accepts a model name that has actually appeared in usage data."
+                            .yellow()
+                    );
+                    eprintln!();
+                    eprintln!("{}", "Models seen in usage records:".bold());
+                    if known.is_empty() {
+                        eprintln!(
+                            "  (none yet — run `tokentracker sync` first so real model names exist)"
+                        );
+                    } else {
+                        for m in &known {
+                            eprintln!("  {}", m.cyan());
+                        }
+                    }
+                    let close: Vec<&String> = known
+                        .iter()
+                        .filter(|m| {
+                            m.contains(&model)
+                                || model.to_ascii_lowercase().contains(&m.to_ascii_lowercase())
+                        })
+                        .collect();
+                    if !close.is_empty() {
+                        eprintln!();
+                        eprintln!("{}", "Closest matches:".bold());
+                        for m in close {
+                            eprintln!("  {}", m.cyan());
+                        }
+                    }
+                    std::process::exit(1);
+                }
+                let ov = crate::models::PricingOverride {
+                    model: model.clone(),
+                    input_per_mtok: input,
+                    output_per_mtok: output,
+                    cache_read_per_mtok: cache_read,
+                    cache_write_per_mtok: cache_write,
+                    set_at: chrono::Utc::now().to_rfc3339(),
+                };
+                db.upsert_pricing_override(&ov)?;
+                println!(
+                    "{}",
+                    format!(
+                        "Set override for {}: ${:.4}/M in, ${:.4}/M out{}",
+                        model.cyan(),
+                        input,
+                        output,
+                        if cache_read.is_some() || cache_write.is_some() {
+                            format!(
+                                " (cache read ${:.4}/M, cache write ${:.4}/M)",
+                                cache_read.unwrap_or(0.0),
+                                cache_write.unwrap_or(0.0)
+                            )
+                        } else {
+                            String::new()
+                        }
+                    )
+                    .bold()
+                );
+            }
+            Commands::PriceList { unpriced } => {
+                use colored::Colorize;
+                if unpriced {
+                    let known = db.distinct_model_names()?;
+                    let mut unpriced: Vec<String> = Vec::new();
+                    for m in &known {
+                        if costs::calculate_cost(
+                            m,
+                            "unknown",
+                            0,
+                            0,
+                            0,
+                            0,
+                        )
+                        .is_none()
+                        {
+                            unpriced.push(m.clone());
+                        }
+                    }
+                    if unpriced.is_empty() {
+                        println!(
+                            "{}",
+                            "No unpriced models in usage data. Everything has a price."
+                                .green()
+                                .bold()
+                        );
+                    } else {
+                        println!("{}", "Models in usage data with no price:".bold());
+                        for m in &unpriced {
+                            println!("  {}", m.yellow());
+                        }
+                        println!();
+                        println!(
+                            "{}",
+                            "Set a price with `tokentracker price-set <model> --input <rate> --output <rate>`."
+                                .dimmed()
+                        );
+                    }
+                } else {
+                    let overrides = db.pricing_overrides()?;
+                    if overrides.is_empty() {
+                        println!("{}", "No manual price overrides set.".dimmed());
+                    } else {
+                        println!("{}", "Manual price overrides:".bold());
+                        for ov in overrides {
+                            println!(
+                                "  {:<30} ${:.4}/M in  ${:.4}/M out  {}",
+                                ov.model.cyan(),
+                                ov.input_per_mtok,
+                                ov.output_per_mtok,
+                                if ov.cache_read_per_mtok.is_some()
+                                    || ov.cache_write_per_mtok.is_some()
+                                {
+                                    format!(
+                                        "(cache read ${:.4}, write ${:.4})",
+                                        ov.cache_read_per_mtok.unwrap_or(0.0),
+                                        ov.cache_write_per_mtok.unwrap_or(0.0)
+                                    )
+                                } else {
+                                    String::new()
+                                }
+                            );
+                        }
+                    }
+                }
             }
             Commands::Antigravity { days, json } => {
                 let collector = collectors::antigravity::AntigravityCollector::new(

@@ -64,3 +64,13 @@ pub struct AntigravityRequest {
     pub model: String,
     pub request_count: i64,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PricingOverride {
+    pub model: String,
+    pub input_per_mtok: f64,
+    pub output_per_mtok: f64,
+    pub cache_read_per_mtok: Option<f64>,
+    pub cache_write_per_mtok: Option<f64>,
+    pub set_at: String,
+}

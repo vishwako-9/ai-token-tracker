@@ -1,7 +1,7 @@
 use anyhow::{bail, Result};
 use rusqlite::Connection;
 
-const LATEST_SCHEMA_VERSION: i64 = 2;
+const LATEST_SCHEMA_VERSION: i64 = 3;
 
 const CREATE_USAGE_RECORDS_TABLE_SQL: &str = "
     CREATE TABLE IF NOT EXISTS usage_records (
@@ -18,6 +18,17 @@ const CREATE_USAGE_RECORDS_TABLE_SQL: &str = "
         recorded_at TEXT NOT NULL,
         collected_at TEXT NOT NULL,
         metadata TEXT
+    );
+";
+
+const CREATE_PRICING_OVERRIDES_TABLE_SQL: &str = "
+    CREATE TABLE IF NOT EXISTS pricing_overrides (
+        model TEXT PRIMARY KEY,
+        input_per_mtok REAL NOT NULL,
+        output_per_mtok REAL NOT NULL,
+        cache_read_per_mtok REAL,
+        cache_write_per_mtok REAL,
+        set_at TEXT NOT NULL
     );
 ";
 
@@ -91,6 +102,7 @@ fn create_schema_v1(conn: &Connection) -> Result<()> {
     conn.execute_batch(CREATE_USAGE_RECORDS_TABLE_SQL)?;
     conn.execute_batch(CREATE_INDEXES_SQL)?;
     conn.execute_batch(CREATE_ANTIGRAVITY_REQUESTS_TABLE_SQL)?;
+    conn.execute_batch(CREATE_PRICING_OVERRIDES_TABLE_SQL)?;
     Ok(())
 }
 
@@ -106,6 +118,7 @@ fn migrate(conn: &Connection, from: i64, to: i64) -> Result<()> {
     while version < to {
         match version {
             1 => migrate_v1_to_v2(&tx)?,
+            2 => migrate_v2_to_v3(&tx)?,
             _ => bail!("No migration path from schema version {}", version),
         }
         version += 1;
@@ -117,6 +130,11 @@ fn migrate(conn: &Connection, from: i64, to: i64) -> Result<()> {
 
 fn migrate_v1_to_v2(conn: &Connection) -> Result<()> {
     conn.execute_batch(CREATE_ANTIGRAVITY_REQUESTS_TABLE_SQL)?;
+    Ok(())
+}
+
+fn migrate_v2_to_v3(conn: &Connection) -> Result<()> {
+    conn.execute_batch(CREATE_PRICING_OVERRIDES_TABLE_SQL)?;
     Ok(())
 }
 
@@ -144,6 +162,7 @@ mod tests {
         assert_eq!(current_schema_version(&conn).unwrap(), LATEST_SCHEMA_VERSION);
         assert!(table_exists(&conn, "usage_records").unwrap());
         assert!(table_exists(&conn, "antigravity_requests").unwrap());
+        assert!(table_exists(&conn, "pricing_overrides").unwrap());
     }
 
     #[test]

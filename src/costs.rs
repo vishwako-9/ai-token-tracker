@@ -143,33 +143,57 @@ pub fn calculate_cost(
     cache_read_tokens: i64,
     cache_write_tokens: i64,
 ) -> Option<f64> {
-    if let Some(entries) = load_cached_pricing() {
+    // Manually set override always wins over any automatic estimate.
+    if let Some(ov) = pricing_override(model) {
+        let per_mtok = |tokens: i64, rate: f64| (tokens as f64 / 1_000_000.0) * rate;
+        let cost = per_mtok(input_tokens, ov.input_per_mtok)
+            + per_mtok(output_tokens, ov.output_per_mtok)
+            + ov.cache_read_per_mtok
+                .map(|r| per_mtok(cache_read_tokens, r))
+                .unwrap_or(0.0)
+            + ov.cache_write_per_mtok
+                .map(|r| per_mtok(cache_write_tokens, r))
+                .unwrap_or(0.0);
+        return Some(cost);
+    }
+
+    let entry = load_cached_pricing().and_then(|entries| {
         let prefixed = format!("{}/{}", provider, model);
-        let entry = entries
+        entries
             .get(model)
             .or_else(|| entries.get(&prefixed))
+            .or_else(|| model.rsplit_once('/').and_then(|(_, bare)| entries.get(bare)))
             .or_else(|| {
-                model
-                    .rsplit_once('/')
-                    .and_then(|(_, bare)| entries.get(bare))
-            });
+                // No match under the provider-scoped keys. Search the cached
+                // entries by model name alone across ALL providers: a proxy like
+                // OpenCode Zen routes many vendors' models, so a static provider
+                // mapping can't be correct for every one of them.
+                entries
+                    .iter()
+                    .find(|(k, _)| {
+                        k.split('/')
+                            .last()
+                            .map_or(false, |s| s.eq_ignore_ascii_case(model))
+                    })
+                    .map(|(_, e)| e)
+            })
+    });
 
-        if let Some(entry) = entry {
-            if let (Some(input_cpt), Some(output_cpt)) =
-                (entry.input_cost_per_token, entry.output_cost_per_token)
-            {
-                let input_cost = input_tokens as f64 * input_cpt;
-                let output_cost = output_tokens as f64 * output_cpt;
-                let cache_read_cost = entry
-                    .cache_read_input_token_cost
-                    .map(|c| cache_read_tokens as f64 * c)
-                    .unwrap_or(0.0);
-                let cache_write_cost = entry
-                    .cache_creation_input_token_cost
-                    .map(|c| cache_write_tokens as f64 * c)
-                    .unwrap_or(0.0);
-                return Some(input_cost + output_cost + cache_read_cost + cache_write_cost);
-            }
+    if let Some(entry) = entry {
+        if let (Some(input_cpt), Some(output_cpt)) =
+            (entry.input_cost_per_token, entry.output_cost_per_token)
+        {
+            let input_cost = input_tokens as f64 * input_cpt;
+            let output_cost = output_tokens as f64 * output_cpt;
+            let cache_read_cost = entry
+                .cache_read_input_token_cost
+                .map(|c| cache_read_tokens as f64 * c)
+                .unwrap_or(0.0);
+            let cache_write_cost = entry
+                .cache_creation_input_token_cost
+                .map(|c| cache_write_tokens as f64 * c)
+                .unwrap_or(0.0);
+            return Some(input_cost + output_cost + cache_read_cost + cache_write_cost);
         }
     }
 
@@ -191,6 +215,27 @@ pub fn litellm_provider(provider: &str) -> &str {
         "gemini_cli" | "antigravity" => "gemini",
         other => other,
     }
+}
+
+/// Manually set pricing override for a model, loaded lazily from the
+/// pricing_overrides table. Mirrors the PRICING_CACHE pattern: the map is
+/// read once per process (a CLI invocation is short-lived, so staleness is
+/// a non-issue) and never re-opened per record.
+static PRICING_OVERRIDES: OnceLock<HashMap<String, crate::models::PricingOverride>> = OnceLock::new();
+
+pub fn pricing_override(model: &str) -> Option<crate::models::PricingOverride> {
+    let overrides = PRICING_OVERRIDES.get_or_init(|| {
+        let cfg = crate::config::load_config().ok();
+        let db = cfg.and_then(|cfg| crate::db::Database::open(&cfg.db_path).ok());
+        db.and_then(|db| db.pricing_overrides().ok())
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|ov| (ov.model.clone(), ov))
+                    .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default()
+    });
+    overrides.get(model).cloned()
 }
 
 /// Price a record at API list rates if it has no stored cost. Every token has

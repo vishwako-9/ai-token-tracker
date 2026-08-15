@@ -3,7 +3,9 @@ use rusqlite::{params, Connection};
 
 use std::collections::BTreeMap;
 
-use crate::models::{AntigravityRequest, DailyRow, ModelEntry, SummaryRow, UsageRecord};
+use crate::models::{
+    AntigravityRequest, DailyRow, ModelEntry, PricingOverride, SummaryRow, UsageRecord,
+};
 
 pub fn insert_record(conn: &Connection, record: &UsageRecord) -> Result<usize> {
     conn.execute(
@@ -80,9 +82,56 @@ pub fn query_antigravity_requests(
     Ok(results)
 }
 
-/// Price every record that has no stored cost using API list rates. Returns
-/// the number of records that received a cost. Idempotent: rows with a cost
-/// are never touched.
+/// Every distinct model name that has ever appeared in the usage records
+/// table, sorted. Used to validate `price-set` so typos or made-up names
+/// cannot create dead pricing entries.
+pub fn distinct_model_names(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT DISTINCT model FROM usage_records ORDER BY model")?;
+    let names = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(names)
+}
+
+/// All manual pricing overrides, keyed by model.
+pub fn pricing_overrides(conn: &Connection) -> Result<Vec<PricingOverride>> {
+    let mut stmt = conn.prepare(
+        "SELECT model, input_per_mtok, output_per_mtok, cache_read_per_mtok,
+                cache_write_per_mtok, set_at
+         FROM pricing_overrides ORDER BY model",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(PricingOverride {
+                model: row.get(0)?,
+                input_per_mtok: row.get(1)?,
+                output_per_mtok: row.get(2)?,
+                cache_read_per_mtok: row.get(3)?,
+                cache_write_per_mtok: row.get(4)?,
+                set_at: row.get(5)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Insert or replace a manual pricing override for a model.
+pub fn upsert_pricing_override(conn: &Connection, ov: &PricingOverride) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO pricing_overrides
+         (model, input_per_mtok, output_per_mtok, cache_read_per_mtok, cache_write_per_mtok, set_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            ov.model,
+            ov.input_per_mtok,
+            ov.output_per_mtok,
+            ov.cache_read_per_mtok,
+            ov.cache_write_per_mtok,
+            ov.set_at,
+        ],
+    )?;
+    Ok(())
+}
 pub fn recompute_missing_costs(conn: &Connection) -> Result<usize> {
     apply_pricing(conn, "WHERE cost_usd IS NULL")
 }
@@ -606,6 +655,116 @@ mod reprice_tests {
         insert(&conn, "totally-unknown", 1_000, 100, 0, Some(5.0));
         assert_eq!(recompute_all_costs(&conn).unwrap(), 0);
 }
+}
+
+#[cfg(test)]
+mod pricing_override_tests {
+    use super::*;
+
+    fn open_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::initialize(&conn).unwrap();
+        conn
+    }
+
+    fn insert_record(conn: &Connection, model: &str) {
+        conn.execute(
+            "INSERT OR IGNORE INTO usage_records (
+                provider, model, input_tokens, output_tokens,
+                cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                cost_usd, session_id, recorded_at, collected_at, metadata
+             ) VALUES (?1,?2,0,0,0,0,0,NULL,NULL,?3,?4,NULL)",
+            rusqlite::params![
+                "opencode",
+                model,
+                "2026-08-15",
+                "2026-08-15T00:00:00Z",
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn distinct_model_names_returns_unique_sorted_models() {
+        let conn = open_conn();
+        insert_record(&conn, "gpt-5");
+        insert_record(&conn, "claude-sonnet-4");
+        insert_record(&conn, "gpt-5");
+        insert_record(&conn, "deepseek-v4-flash-free");
+        let names = distinct_model_names(&conn).unwrap();
+        assert_eq!(
+            names,
+            vec![
+                "claude-sonnet-4".to_string(),
+                "deepseek-v4-flash-free".to_string(),
+                "gpt-5".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn distinct_model_names_empty_when_no_records() {
+        let conn = open_conn();
+        assert!(distinct_model_names(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn upsert_and_read_pricing_override_roundtrip() {
+        let conn = open_conn();
+        insert_record(&conn, "my-ghost-model");
+        upsert_pricing_override(
+            &conn,
+            &PricingOverride {
+                model: "my-ghost-model".into(),
+                input_per_mtok: 5.0,
+                output_per_mtok: 10.0,
+                cache_read_per_mtok: Some(0.5),
+                cache_write_per_mtok: None,
+                set_at: "2026-08-15T00:00:00Z".into(),
+            },
+        )
+        .unwrap();
+        let all = pricing_overrides(&conn).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].model, "my-ghost-model");
+        assert_eq!(all[0].input_per_mtok, 5.0);
+        assert_eq!(all[0].output_per_mtok, 10.0);
+        assert_eq!(all[0].cache_read_per_mtok, Some(0.5));
+        assert_eq!(all[0].cache_write_per_mtok, None);
+    }
+
+    #[test]
+    fn upsert_replaces_existing_override() {
+        let conn = open_conn();
+        insert_record(&conn, "m");
+        upsert_pricing_override(
+            &conn,
+            &PricingOverride {
+                model: "m".into(),
+                input_per_mtok: 1.0,
+                output_per_mtok: 1.0,
+                cache_read_per_mtok: None,
+                cache_write_per_mtok: None,
+                set_at: "2026-08-15T00:00:00Z".into(),
+            },
+        )
+        .unwrap();
+        upsert_pricing_override(
+            &conn,
+            &PricingOverride {
+                model: "m".into(),
+                input_per_mtok: 9.0,
+                output_per_mtok: 9.0,
+                cache_read_per_mtok: None,
+                cache_write_per_mtok: None,
+                set_at: "2026-08-16T00:00:00Z".into(),
+            },
+        )
+        .unwrap();
+        let all = pricing_overrides(&conn).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].input_per_mtok, 9.0);
+    }
 }
 
 
