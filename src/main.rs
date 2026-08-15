@@ -5,6 +5,8 @@ mod db;
 mod display;
 mod models;
 mod server;
+mod theme;
+mod tui;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -76,7 +78,7 @@ enum Commands {
     },
     /// Show monthly usage breakdown
     Monthly {
-        #[arg(short, long, default_value = "6")]
+        #[arg(long, default_value = "6")]
         months: u32,
         #[arg(short = 'P', long)]
         provider: Option<Provider>,
@@ -137,6 +139,28 @@ enum Commands {
         #[arg(short, long)]
         port: Option<u16>,
     },
+    /// Launch the interactive terminal UI
+    Tui {
+        /// Number of days to look back (default: 30)
+        #[arg(short, long, default_value = "30")]
+        days: u32,
+    },
+    /// Recompute cost for all records from current pricing
+    Reprice,
+    /// Count Antigravity requests per model/day (token usage unavailable)
+    Antigravity {
+        /// Number of days to look back (default: 30)
+        #[arg(short, long, default_value = "30")]
+        days: u32,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Generate shell tab-completion scripts
+    Completions {
+        /// Target shell: bash, elvish, fish, powershell, zsh
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
 }
 
 fn canonical_provider(p: Option<Provider>) -> Option<&'static str> {
@@ -150,17 +174,11 @@ async fn cmd_sync(
 ) -> Result<()> {
     use colored::Colorize;
 
-    if cfg.fetch_pricing {
-        let cache = dirs::cache_dir()
-            .unwrap_or_default()
-            .join("tokentracker")
-            .join("litellm_pricing.json");
-        if !cache.exists() {
-            print!("First run: fetching model pricing... ");
-            match costs::update_pricing_cache().await {
-                Ok(_) => println!("{}", "ok".green()),
-                Err(e) => println!("{}: {} (using fallback)", "warn".yellow(), e),
-            }
+    if cfg.fetch_pricing && costs::pricing_cache_stale() {
+        print!("Refreshing model pricing... ");
+        match costs::update_pricing_cache().await {
+            Ok(_) => println!("{}", "ok".green()),
+            Err(e) => println!("{}: {} (using cached/fallback)", "warn".yellow(), e),
         }
     }
 
@@ -202,6 +220,17 @@ async fn cmd_sync(
             }
         }
     }
+
+    // Every token has a market price even on subscription/"free" plans; price
+    // any record still missing a cost so reports show an estimate, not $0.
+    let priced = db.recompute_missing_costs()?;
+    if priced > 0 {
+        println!(
+            "{}",
+            format!("Priced {priced} previously-unpriced records at API list rates (estimated).")
+                .yellow()
+        );
+    }
     println!(
         "{}",
         format!("Synced {total_records} usage records.").bold()
@@ -216,7 +245,6 @@ fn cmd_status(cfg: &config::Config) -> Result<()> {
         let state = match status.state {
             collectors::LocalCollectorState::Detected => "detected".green(),
             collectors::LocalCollectorState::NotFound => "not found".dimmed(),
-            collectors::LocalCollectorState::Unsupported => "unsupported".yellow(),
         };
         if let Some(note) = status.note {
             println!(
@@ -361,6 +389,49 @@ fn main() -> Result<()> {
             }
             Commands::Serve { port } => {
                 server::serve(&cfg.db_path, port).await?;
+            }
+            Commands::Tui { days } => {
+                tui::run(db, days)?;
+            }
+            Commands::Reprice => {
+                use colored::Colorize;
+                if cfg.fetch_pricing && costs::pricing_cache_stale() {
+                    print!("Refreshing model pricing... ");
+                    match costs::update_pricing_cache().await {
+                        Ok(_) => println!("{}", "ok".green()),
+                        Err(e) => println!("{}: {} (using cached/fallback)", "warn".yellow(), e),
+                    }
+                }
+                let priced = db.recompute_all_costs()?;
+                println!(
+                    "{}",
+                    format!("Repriced {priced} records at current API list rates.").bold()
+                );
+            }
+            Commands::Antigravity { days, json } => {
+                let collector = collectors::antigravity::AntigravityCollector::new(
+                    collectors::antigravity_conv_dir(),
+                );
+                let requests = collector.collect_requests()?;
+                db.upsert_antigravity_requests(&requests)?;
+                if json {
+                    let since = chrono::Utc::now() - chrono::Duration::days(days as i64);
+                    let since_str = since.format("%Y-%m-%d").to_string();
+                    let rows = db.query_antigravity_requests(Some(&since_str))?;
+                    println!("{}", serde_json::to_string_pretty(&rows)?);
+                } else {
+                    let since = chrono::Utc::now() - chrono::Duration::days(days as i64);
+                    let since_str = since.format("%Y-%m-%d").to_string();
+                    let rows = db.query_antigravity_requests(Some(&since_str))?;
+                    display::print_antigravity_requests(&rows);
+                }
+            }
+            Commands::Completions { shell } => {
+                use clap::CommandFactory;
+                use clap_complete::generate;
+                let mut cmd = Cli::command();
+                let bin_name = cmd.get_name().to_string();
+                generate(shell, &mut cmd, bin_name, &mut std::io::stdout());
             }
         }
         Ok(())
