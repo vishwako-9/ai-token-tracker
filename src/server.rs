@@ -31,8 +31,10 @@ async fn handle_index() -> impl IntoResponse {
     axum::response::Html(DASHBOARD_HTML)
 }
 
-async fn handle_health() -> impl IntoResponse {
-    axum::Json(serde_json::json!({ "ok": true }))
+async fn handle_health(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+) -> impl IntoResponse {
+    axum::Json(serde_json::json!({ "ok": true, "db_path": state.db_path }))
 }
 
 async fn handle_usage(Query(q): Query<DaysParam>, axum::extract::State(state): axum::extract::State<Arc<AppState>>) -> Result<impl IntoResponse, (StatusCode, String)> {

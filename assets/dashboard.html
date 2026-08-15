@@ -34,13 +34,13 @@
   tbody tr:hover { background: #1c2128; }
   .section { margin-bottom: 28px; }
   .section h2 { font-size: 14px; color: #58a6ff; margin: 0 0 10px; }
-  canvas { background: #161b22; border: 1px solid #30363d; border-radius: 8px; }
+  canvas { display: block; width: 100%; background: #161b22; border: 1px solid #30363d; border-radius: 8px; }
   .err { color: #f85149; }
 </style>
 </head>
 <body>
   <h1>tokentracker <span>dashboard</span></h1>
-  <div class="sub">Local AI coding token usage &amp; cost — data from <code>~/.config/tokentracker/tokentracker.db</code></div>
+  <div class="sub">Local AI coding token usage &amp; cost — data from <code id="db-path">…</code></div>
 
   <div class="controls">
     <label>Range</label>
@@ -160,6 +160,11 @@ function drawChart(rows) {
 $("refresh").addEventListener("click", refresh);
 $("range").addEventListener("change", refresh);
 refresh();
+
+fetch("/api/health")
+  .then((r) => r.json())
+  .then((h) => { if (h.db_path) $("db-path").textContent = h.db_path; })
+  .catch(() => {});
 </script>
 </body>
 </html>
