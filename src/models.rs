@@ -57,3 +57,10 @@ pub struct ModelPricing {
     pub cache_read_per_mtok: Option<f64>,
     pub cache_write_per_mtok: Option<f64>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AntigravityRequest {
+    pub date: String,
+    pub model: String,
+    pub request_count: i64,
+}

@@ -114,7 +114,7 @@ impl Collector for OpenCodeCollector {
                 cache_read_tokens: s.tokens_cache_read.unwrap_or(0).max(0),
                 cache_write_tokens: s.tokens_cache_write.unwrap_or(0).max(0),
                 reasoning_tokens: s.tokens_reasoning.unwrap_or(0).max(0),
-                cost_usd: s.cost,
+                cost_usd: s.cost.filter(|c| *c > 0.0),
                 session_id: s.id,
                 recorded_at,
                 collected_at: collected_at.clone(),

@@ -55,7 +55,6 @@ pub struct LocalCollectorStatus {
 pub enum LocalCollectorState {
     Detected,
     NotFound,
-    Unsupported,
 }
 
 pub fn get_collectors(
@@ -155,12 +154,12 @@ pub fn local_collector_statuses() -> Vec<LocalCollectorStatus> {
         LocalCollectorStatus {
             name: "antigravity",
             state: if antigravity_conv_dir().exists() {
-                LocalCollectorState::Unsupported
+                LocalCollectorState::Detected
             } else {
                 LocalCollectorState::NotFound
             },
             path: antigravity_conv_dir(),
-            note: Some("conversations are protobuf blobs; token usage is not parseable in v1"),
+            note: Some("token usage is not parseable (protobuf blobs); request volume via `tokentracker antigravity`"),
         },
         LocalCollectorStatus {
             name: "ollama",
@@ -197,9 +196,9 @@ pub fn explain_provider_filter(cfg: &Config, provider_filter: &str) -> String {
             "Provider 'gemini_cli' is supported but no ~/.gemini/tmp session logs were found."
                 .to_string()
         }
-        "antigravity" => "Provider 'antigravity' is detected but its conversations are stored as "
+        "antigravity" => "Provider 'antigravity' does not expose token usage locally "
             .to_string()
-            + "protobuf blobs, which v1 does not parse.",
+            + "(conversations are protobuf blobs); run `tokentracker antigravity` for request volume.",
         "ollama" => {
             if cfg.ollama_enabled {
                 "Provider 'ollama' is enabled, but Ollama has no historical token usage API; "

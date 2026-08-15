@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 use anyhow::Result;
 use serde::Deserialize;
 
-use crate::models::ModelPricing;
+use crate::models::{ModelPricing, UsageRecord};
 
 const LITELLM_PRICING_URL: &str =
     "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
@@ -48,6 +48,25 @@ pub async fn update_pricing_cache() -> Result<()> {
     }
     std::fs::write(&path, &body)?;
     Ok(())
+}
+
+const PRICING_CACHE_MAX_AGE_DAYS: u64 = 7;
+
+/// True when the cached pricing file is missing or older than
+/// `PRICING_CACHE_MAX_AGE_DAYS`, so sync can refresh rates automatically.
+pub fn pricing_cache_stale() -> bool {
+    let path = cache_path();
+    let Ok(meta) = std::fs::metadata(&path) else {
+        return true;
+    };
+    let Ok(modified) = meta.modified() else {
+        return true;
+    };
+    let age_days = std::time::SystemTime::now()
+        .duration_since(modified)
+        .map(|d| d.as_secs() / 86_400)
+        .unwrap_or(u64::MAX);
+    age_days >= PRICING_CACHE_MAX_AGE_DAYS
 }
 
 static PRICING_CACHE: OnceLock<Option<HashMap<String, LiteLLMEntry>>> = OnceLock::new();
@@ -163,6 +182,41 @@ pub fn calculate_cost(
     )
 }
 
+/// Map a local provider name to the LiteLLM provider family used for the
+/// `provider/model` pricing key lookup.
+pub fn litellm_provider(provider: &str) -> &str {
+    match provider {
+        "claude_code" => "anthropic",
+        "codex" | "opencode" => "openai",
+        "gemini_cli" | "antigravity" => "gemini",
+        other => other,
+    }
+}
+
+/// Price a record at API list rates if it has no stored cost. Every token has
+/// a market price even when the user is on a subscription or a "free" model;
+/// this gives an estimated cost basis rather than a flat $0.
+/// Returns true if a cost was assigned.
+pub fn price_record(record: &mut UsageRecord) -> bool {
+    if record.cost_usd.is_some() {
+        return false;
+    }
+    match calculate_cost(
+        &record.model,
+        litellm_provider(&record.provider),
+        record.input_tokens,
+        record.output_tokens,
+        record.cache_read_tokens,
+        record.cache_write_tokens,
+    ) {
+        Some(cost) => {
+            record.cost_usd = Some(cost);
+            true
+        }
+        None => false,
+    }
+}
+
 struct FallbackRates {
     input: f64,
     output: f64,
@@ -175,6 +229,15 @@ fn rates_no_cache(input: f64, output: f64) -> FallbackRates {
         input,
         output,
         cache_read: None,
+        cache_write: None,
+    }
+}
+
+fn rates_cache_read(input: f64, output: f64, cache_read: f64) -> FallbackRates {
+    FallbackRates {
+        input,
+        output,
+        cache_read: Some(cache_read),
         cache_write: None,
     }
 }
@@ -234,11 +297,15 @@ fn fallback_rates(model: &str) -> Option<FallbackRates> {
     if has_word(model, "o3") {
         return Some(rates_no_cache(2.0, 8.0));
     }
-    if model.contains("deepseek-reasoner") {
-        return Some(rates_no_cache(0.55, 2.19));
+    if model.contains("deepseek-v4-pro") {
+        return Some(rates_cache_read(0.435, 0.87, 0.003625));
     }
-    if model.contains("deepseek-chat") {
-        return Some(rates_no_cache(0.27, 1.10));
+    if model.contains("deepseek") {
+        // deepseek-chat/deepseek-reasoner were retired 2026-07-24 and now map
+        // to v4-flash. "free" tiers (e.g. deepseek-v4-flash-free on OpenCode
+        // Zen) are the same model: we price them at v4-flash list rates as the
+        // estimated value of usage rather than showing $0.
+        return Some(rates_cache_read(0.14, 0.28, 0.0028));
     }
     if model.contains("gemini-2.5-flash") || model.contains("gemini-3-flash") {
         return Some(rates_no_cache(0.30, 2.50));
@@ -379,5 +446,68 @@ mod fallback_tests {
     fn gemini_3_family_has_pricing() {
         let c = calculate_cost_fallback("gemini-3-flash", 1_000_000, 0, 0, 0).unwrap();
         assert!((c - 0.30).abs() < 1e-9);
+    }
+
+    #[test]
+    fn price_record_assigns_cost_when_missing() {
+        let mut record = UsageRecord {
+            id: None,
+            provider: "codex".to_string(),
+            model: "gpt-5".to_string(),
+            input_tokens: 1_000_000,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+            cost_usd: None,
+            session_id: None,
+            recorded_at: "2026-08-15".into(),
+            collected_at: "t".into(),
+            metadata: None,
+        };
+        assert!(price_record(&mut record));
+        assert_eq!(record.cost_usd, Some(1.25));
+    }
+
+    #[test]
+    fn free_deepseek_alias_prices_at_v4_flash_rates() {
+        let c = calculate_cost_fallback("deepseek-v4-flash-free", 1_000_000, 0, 0, 0).unwrap();
+        assert!((c - 0.14).abs() < 1e-9);
+        let c = calculate_cost_fallback("deepseek-chat", 1_000_000, 0, 0, 0).unwrap();
+        assert!((c - 0.14).abs() < 1e-9);
+        let cache = calculate_cost_fallback("deepseek-v4-flash-free", 0, 0, 1_000_000, 0).unwrap();
+        assert!((cache - 0.0028).abs() < 1e-9);
+        let pro = calculate_cost_fallback("deepseek-v4-pro", 1_000_000, 0, 0, 0).unwrap();
+        assert!((pro - 0.435).abs() < 1e-9);
+    }
+
+    #[test]
+    fn price_record_skips_existing_cost() {
+        let mut record = UsageRecord {
+            id: None,
+            provider: "claude_code".to_string(),
+            model: "claude-sonnet-5".to_string(),
+            input_tokens: 10,
+            output_tokens: 10,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+            cost_usd: Some(0.123),
+            session_id: None,
+            recorded_at: "2026-08-15".into(),
+            collected_at: "t".into(),
+            metadata: None,
+        };
+        assert!(!price_record(&mut record));
+        assert_eq!(record.cost_usd, Some(0.123));
+    }
+
+    #[test]
+    fn litellm_provider_maps_local_names() {
+        assert_eq!(litellm_provider("claude_code"), "anthropic");
+        assert_eq!(litellm_provider("codex"), "openai");
+        assert_eq!(litellm_provider("opencode"), "openai");
+        assert_eq!(litellm_provider("gemini_cli"), "gemini");
+        assert_eq!(litellm_provider("antigravity"), "gemini");
     }
 }

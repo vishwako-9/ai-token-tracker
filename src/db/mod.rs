@@ -25,6 +25,14 @@ impl Database {
         queries::insert_record(&self.conn, record)
     }
 
+    pub fn recompute_missing_costs(&self) -> Result<usize> {
+        queries::recompute_missing_costs(&self.conn)
+    }
+
+    pub fn recompute_all_costs(&self) -> Result<usize> {
+        queries::recompute_all_costs(&self.conn)
+    }
+
     pub fn query_summary(
         &self,
         days: u32,
@@ -76,5 +84,19 @@ impl Database {
         limit: Option<usize>,
     ) -> Result<Vec<crate::models::UsageRecord>> {
         queries::query_detail(&self.conn, model, provider, since, until, limit)
+    }
+
+    pub fn upsert_antigravity_requests(
+        &self,
+        requests: &[crate::models::AntigravityRequest],
+    ) -> Result<()> {
+        queries::upsert_antigravity_requests(&self.conn, requests)
+    }
+
+    pub fn query_antigravity_requests(
+        &self,
+        since: Option<&str>,
+    ) -> Result<Vec<crate::models::AntigravityRequest>> {
+        queries::query_antigravity_requests(&self.conn, since)
     }
 }

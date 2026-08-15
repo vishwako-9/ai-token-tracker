@@ -1,9 +1,9 @@
-use anyhow::Result;
+﻿use anyhow::Result;
 use rusqlite::{params, Connection};
 
 use std::collections::BTreeMap;
 
-use crate::models::{DailyRow, ModelEntry, SummaryRow, UsageRecord};
+use crate::models::{AntigravityRequest, DailyRow, ModelEntry, SummaryRow, UsageRecord};
 
 pub fn insert_record(conn: &Connection, record: &UsageRecord) -> Result<usize> {
     conn.execute(
@@ -27,6 +27,122 @@ pub fn insert_record(conn: &Connection, record: &UsageRecord) -> Result<usize> {
         ],
     )?;
     Ok(conn.changes() as usize)
+}
+
+/// Replace stored request counts for the given (date, model) pairs. The table
+/// is regenerated from source on each sync, so REPLACE is the right shape.
+pub fn upsert_antigravity_requests(
+    conn: &Connection,
+    requests: &[AntigravityRequest],
+) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    {
+        let mut stmt = tx.prepare(
+            "INSERT OR REPLACE INTO antigravity_requests (date, model, request_count)
+             VALUES (?1, ?2, ?3)",
+        )?;
+        for r in requests {
+            stmt.execute(params![r.date, r.model, r.request_count])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn query_antigravity_requests(
+    conn: &Connection,
+    since: Option<&str>,
+) -> Result<Vec<AntigravityRequest>> {
+    let mut sql = String::from(
+        "SELECT date, model, request_count FROM antigravity_requests WHERE 1=1",
+    );
+    let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = vec![];
+    if let Some(s) = since {
+        sql.push_str(&format!(" AND date >= ?{}", param_values.len() + 1));
+        param_values.push(Box::new(s.to_string()));
+    }
+    sql.push_str(" ORDER BY date ASC, request_count DESC, model ASC");
+
+    let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+        param_values.iter().map(|p| p.as_ref()).collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_refs.as_slice(), |row| {
+        Ok(AntigravityRequest {
+            date: row.get(0)?,
+            model: row.get(1)?,
+            request_count: row.get(2)?,
+        })
+    })?;
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row?);
+    }
+    Ok(results)
+}
+
+/// Price every record that has no stored cost using API list rates. Returns
+/// the number of records that received a cost. Idempotent: rows with a cost
+/// are never touched.
+pub fn recompute_missing_costs(conn: &Connection) -> Result<usize> {
+    apply_pricing(conn, "WHERE cost_usd IS NULL")
+}
+
+/// Recompute cost for every record from current rates, overwriting stored
+/// values. Use after `update-pricing` so historical rows reflect price
+/// changes rather than keeping stale numbers.
+pub fn recompute_all_costs(conn: &Connection) -> Result<usize> {
+    apply_pricing(conn, "")
+}
+
+fn apply_pricing(conn: &Connection, where_clause: &str) -> Result<usize> {
+    let sql = format!(
+        "SELECT id, provider, model, input_tokens, output_tokens,
+                cache_read_tokens, cache_write_tokens, reasoning_tokens
+         FROM usage_records {}",
+        where_clause
+    );
+let mut stmt = conn.prepare(&sql)?;
+    let rows: Vec<UsageRecord> = stmt
+        .query_map([], |row| {
+            Ok(UsageRecord {
+                id: row.get(0)?,
+                provider: row.get(1)?,
+                model: row.get(2)?,
+                input_tokens: row.get(3)?,
+                output_tokens: row.get(4)?,
+                cache_read_tokens: row.get(5)?,
+                cache_write_tokens: row.get(6)?,
+                reasoning_tokens: row.get(7)?,
+                cost_usd: None,
+                session_id: None,
+                recorded_at: String::new(),
+                collected_at: String::new(),
+                metadata: None,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+
+    let mut priced = 0usize;
+    let tx = conn.unchecked_transaction()?;
+    {
+        let mut update = tx.prepare("UPDATE usage_records SET cost_usd = ?1 WHERE id = ?2")?;
+        for mut record in rows {
+            if crate::costs::price_record(&mut record) {
+                match update.execute(rusqlite::params![record.cost_usd, record.id]) {
+                    Ok(_) => priced += 1,
+                    // Two rows that become identical after repricing are
+                    // duplicate usage; leave the survivor unpriced rather
+                    // than aborting the whole pass.
+                    Err(rusqlite::Error::SqliteFailure(e, _))
+                        if e.code == rusqlite::ErrorCode::ConstraintViolation => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(priced)
 }
 
 pub fn query_summary(
@@ -405,3 +521,91 @@ mod iso_week_tests {
         assert_eq!(weekly.len(), 2);
     }
 }
+
+#[cfg(test)]
+mod reprice_tests {
+    use super::*;
+
+    fn open_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::initialize(&conn).unwrap();
+        conn
+    }
+
+    fn insert(
+        conn: &Connection,
+        model: &str,
+        input: i64,
+        output: i64,
+        cache_read: i64,
+        cost: Option<f64>,
+    ) {
+        conn.execute(
+            "INSERT OR IGNORE INTO usage_records (
+                provider, model, input_tokens, output_tokens,
+                cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                cost_usd, session_id, recorded_at, collected_at, metadata
+             ) VALUES (?1,?2,?3,?4,?5,0,0,?6,NULL,?7,?8,NULL)",
+            rusqlite::params![
+                "opencode",
+                model,
+                input,
+                output,
+                cache_read,
+                cost,
+                "2026-08-15",
+                "2026-08-15T00:00:00Z",
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn reprice_all_overwrites_and_fills() {
+        let conn = open_conn();
+        insert(&conn, "deepseek-v4-flash-free", 1_000_000, 0, 0, Some(0.99));
+        insert(&conn, "deepseek-v4-flash-free", 2_000_000, 0, 0, None);
+
+        assert_eq!(recompute_all_costs(&conn).unwrap(), 2);
+
+        let costs: Vec<f64> = {
+            let mut stmt = conn
+                .prepare("SELECT cost_usd FROM usage_records ORDER BY cost_usd")
+                .unwrap();
+            stmt.query_map([], |row| row.get::<_, f64>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(costs.len(), 2);
+        let mut expected = [0.14, 0.28];
+        for c in costs {
+            let idx = expected
+                .iter()
+                .position(|e| (e - c).abs() < 1e-9)
+                .expect("unexpected cost");
+            expected[idx] = f64::NAN;
+        }
+    }
+
+    #[test]
+    fn reprice_skips_duplicate_rows_instead_of_aborting() {
+        let conn = open_conn();
+        // Two rows identical in everything except stored cost. Repricing both
+        // to the same value would violate the dedup unique index; the pass
+        // must skip the second instead of failing.
+        insert(&conn, "deepseek-v4-flash-free", 1_000_000, 0, 0, Some(0.99));
+        insert(&conn, "deepseek-v4-flash-free", 1_000_000, 0, 0, None);
+
+        assert_eq!(recompute_all_costs(&conn).unwrap(), 1);
+    }
+
+#[test]
+    fn reprice_all_ignores_unknown_models() {
+        let conn = open_conn();
+        insert(&conn, "totally-unknown", 1_000, 100, 0, Some(5.0));
+        assert_eq!(recompute_all_costs(&conn).unwrap(), 0);
+}
+}
+
+

@@ -1,7 +1,7 @@
 use anyhow::{bail, Result};
 use rusqlite::Connection;
 
-const LATEST_SCHEMA_VERSION: i64 = 1;
+const LATEST_SCHEMA_VERSION: i64 = 2;
 
 const CREATE_USAGE_RECORDS_TABLE_SQL: &str = "
     CREATE TABLE IF NOT EXISTS usage_records (
@@ -37,6 +37,18 @@ const CREATE_INDEXES_SQL: &str = "
         recorded_at,
         COALESCE(session_id, ''),
         COALESCE(cost_usd, -1)
+    );
+";
+
+// Request-volume table for providers whose local logs expose no token counts
+// (Antigravity). Kept strictly separate from usage_records: no token or cost
+// columns, so these rows can never pollute token/cost aggregates.
+const CREATE_ANTIGRAVITY_REQUESTS_TABLE_SQL: &str = "
+    CREATE TABLE IF NOT EXISTS antigravity_requests (
+        date TEXT NOT NULL,
+        model TEXT NOT NULL,
+        request_count INTEGER NOT NULL,
+        PRIMARY KEY (date, model)
     );
 ";
 
@@ -78,6 +90,7 @@ fn set_schema_version(conn: &Connection, version: i64) -> Result<()> {
 fn create_schema_v1(conn: &Connection) -> Result<()> {
     conn.execute_batch(CREATE_USAGE_RECORDS_TABLE_SQL)?;
     conn.execute_batch(CREATE_INDEXES_SQL)?;
+    conn.execute_batch(CREATE_ANTIGRAVITY_REQUESTS_TABLE_SQL)?;
     Ok(())
 }
 
@@ -102,8 +115,8 @@ fn migrate(conn: &Connection, from: i64, to: i64) -> Result<()> {
     Ok(())
 }
 
-fn migrate_v1_to_v2(_conn: &Connection) -> Result<()> {
-    // Future migration placeholder. Currently v1 is the latest.
+fn migrate_v1_to_v2(conn: &Connection) -> Result<()> {
+    conn.execute_batch(CREATE_ANTIGRAVITY_REQUESTS_TABLE_SQL)?;
     Ok(())
 }
 
@@ -130,6 +143,7 @@ mod tests {
         initialize(&conn).unwrap();
         assert_eq!(current_schema_version(&conn).unwrap(), LATEST_SCHEMA_VERSION);
         assert!(table_exists(&conn, "usage_records").unwrap());
+        assert!(table_exists(&conn, "antigravity_requests").unwrap());
     }
 
     #[test]

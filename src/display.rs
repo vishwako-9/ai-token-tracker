@@ -1,6 +1,22 @@
 use colored::Colorize;
 
-use crate::models::{DailyRow, ModelPricing, SummaryRow, UsageRecord};
+use crate::models::{AntigravityRequest, DailyRow, ModelPricing, SummaryRow, UsageRecord};
+
+/// Models served on genuinely-free tiers (OpenCode Zen promo models, e.g.
+/// `deepseek-v4-flash-free`) carry a `-free` suffix. We keep the token price
+/// (estimated value of usage) but annotate the model so the $ figure is never
+/// mistaken for an actual bill.
+pub fn is_free_model(model: &str) -> bool {
+    model.ends_with("-free")
+}
+
+fn display_model(model: &str) -> String {
+    if is_free_model(model) {
+        format!("{model} (free)")
+    } else {
+        model.to_string()
+    }
+}
 
 fn fmt_int(n: i64) -> String {
     let s = n.to_string();
@@ -120,7 +136,7 @@ pub fn print_summary(rows: &[SummaryRow]) {
 
     for r in rows {
         cols[0].rows.push(r.provider.clone());
-        cols[1].rows.push(r.model.clone());
+        cols[1].rows.push(display_model(&r.model));
         cols[2].rows.push(fmt_int(r.total_input));
         cols[3].rows.push(fmt_int(r.total_output));
         cols[4].rows.push(fmt_int(r.total_cache_read));
@@ -130,6 +146,11 @@ pub fn print_summary(rows: &[SummaryRow]) {
     }
 
     render_table("Usage Summary", cols, "cyan");
+    println!(
+        "{}",
+        "Costs are estimated from API list prices (subscription and free-tier tokens included)."
+            .dimmed()
+    );
 }
 
 pub fn print_daily(rows: &[DailyRow], title: &str, show_all: bool) {
@@ -153,7 +174,13 @@ pub fn print_daily(rows: &[DailyRow], title: &str, show_all: bool) {
 
     for r in &filtered {
         cols[0].rows.push(r.date.clone());
-        cols[1].rows.push(r.models.join(", "));
+        cols[1].rows.push(
+            r.models
+                .iter()
+                .map(|m| display_model(m))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
         cols[2].rows.push(fmt_int(r.total_input));
         cols[3].rows.push(fmt_int(r.total_output));
         cols[4].rows.push(fmt_cost(r.total_cost));
@@ -178,7 +205,7 @@ pub fn print_detail(rows: &[UsageRecord]) {
     for r in rows {
         cols[0].rows.push(r.recorded_at.chars().take(16).collect());
         cols[1].rows.push(r.provider.clone());
-        cols[2].rows.push(r.model.clone());
+        cols[2].rows.push(display_model(&r.model));
         cols[3].rows.push(fmt_int(r.input_tokens));
         cols[4].rows.push(fmt_int(r.output_tokens));
         cols[5].rows.push(r.cost_usd.map(fmt_cost).unwrap_or_else(|| "-".into()));
@@ -217,6 +244,35 @@ pub fn to_json(rows: &[UsageRecord]) -> anyhow::Result<String> {
     Ok(serde_json::to_string_pretty(rows)?)
 }
 
+pub fn print_antigravity_requests(rows: &[AntigravityRequest]) {
+    if rows.is_empty() {
+        println!("No Antigravity requests recorded for the requested window.");
+        return;
+    }
+
+    let mut cols = vec![
+        Col { header: "Date".into(), rows: vec![], align_right: false },
+        Col { header: "Model".into(), rows: vec![], align_right: false },
+        Col { header: "Requests".into(), rows: vec![], align_right: true },
+    ];
+
+    let mut total: i64 = 0;
+    for r in rows {
+        total += r.request_count;
+        cols[0].rows.push(r.date.clone());
+        cols[1].rows.push(display_model(&r.model));
+        cols[2].rows.push(fmt_int(r.request_count));
+    }
+
+    render_table("Antigravity request volume", cols, "cyan");
+    println!("Total requests: {}", fmt_int(total).bold());
+    println!(
+        "{}",
+        "Note: Antigravity does not expose token counts locally; this is a volume-only count."
+            .dimmed()
+    );
+}
+
 pub fn to_csv(rows: &[UsageRecord]) -> String {
     let mut out = String::from("recorded_at,provider,model,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,reasoning_tokens,cost_usd,session_id\n");
     for r in rows {
@@ -235,4 +291,18 @@ pub fn to_csv(rows: &[UsageRecord]) -> String {
         ));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn free_model_detection_and_annotation() {
+        assert!(is_free_model("deepseek-v4-flash-free"));
+        assert!(is_free_model("nemotron-3-ultra-free"));
+        assert!(!is_free_model("deepseek-v4-flash"));
+        assert_eq!(display_model("deepseek-v4-flash-free"), "deepseek-v4-flash-free (free)");
+        assert_eq!(display_model("claude-opus-4-8"), "claude-opus-4-8");
+    }
 }
