@@ -104,6 +104,7 @@ fn parse_jsonl_file(path: &Path, collected_at: &str) -> Vec<UsageRecord> {
             usage.output_tokens,
             usage.cache_read_input_tokens,
             usage.cache_creation_input_tokens,
+            entry.timestamp.as_deref(),
         );
 
         records.push(UsageRecord {

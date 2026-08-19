@@ -135,6 +135,84 @@ fn normalize_provider(litellm_provider: &str) -> Option<&'static str> {
     }
 }
 
+/// DeepSeek switched from flat rates to time-of-day pricing on
+/// 2026-08-16T16:00:00Z. Records at or after this instant use peak/off-peak
+/// rates; earlier records keep the old flat rates.
+const DEEPSEEK_TIME_PRICING_CUTOVER_UTC: &str = "2026-08-16T16:00:00Z";
+
+/// Parse a stored `recorded_at` value into a UTC timestamp. Accepts the
+/// formats actually produced by the collectors and tests: RFC3339 (with or
+/// without fractional seconds), bare `%Y-%m-%dT%H:%M:%S` (treated as UTC, as
+/// collectors emit `Utc::now().format(...)`), and a date-only `%Y-%m-%d`
+/// (UTC midnight).
+fn parse_recorded_at(ts: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) {
+        return Some(dt.with_timezone(&chrono::Utc));
+    }
+    if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%S") {
+        return Some(chrono::DateTime::from_naive_utc_and_offset(ndt, chrono::Utc));
+    }
+    if let Ok(nd) = chrono::NaiveDate::parse_from_str(ts, "%Y-%m-%d") {
+        if let Some(ndt) = nd.and_hms_opt(0, 0, 0) {
+            return Some(chrono::DateTime::from_naive_utc_and_offset(ndt, chrono::Utc));
+        }
+    }
+    None
+}
+
+fn deepseek_cutover() -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(DEEPSEEK_TIME_PRICING_CUTOVER_UTC)
+        .ok()
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+}
+
+/// DeepSeek peak hours (UTC): 01:00-04:00 and 06:00-10:00, both half-open.
+fn deepseek_is_peak_hour(ts: &chrono::DateTime<chrono::Utc>) -> bool {
+    use chrono::Timelike;
+    let h = ts.hour();
+    (h >= 1 && h < 4) || (h >= 6 && h < 10)
+}
+
+/// DeepSeek time-of-day rates in $/M after the 2026-08-16 cutover. Off-peak is
+/// exactly half of peak.
+fn deepseek_tod_rates(is_pro: bool, peak: bool) -> FallbackRates {
+    if is_pro {
+        if peak {
+            rates_cache_read(1.32, 3.96, 0.044)
+        } else {
+            rates_cache_read(0.66, 1.98, 0.022)
+        }
+    } else if peak {
+        rates_cache_read(0.44, 1.32, 0.014)
+    } else {
+        rates_cache_read(0.22, 0.66, 0.007)
+    }
+}
+
+/// Pick the DeepSeek rate set for a record: the old flat rates before the
+/// cutover, or the peak/off-peak rate matching the record's own UTC hour after
+/// it. With no per-record timestamp (e.g. the `models` listing), the
+/// post-cutover off-peak rate is used as the list price.
+fn deepseek_rates(is_pro: bool, ts: Option<&chrono::DateTime<chrono::Utc>>) -> FallbackRates {
+    let old = if is_pro {
+        rates_cache_read(0.435, 0.87, 0.003625)
+    } else {
+        rates_cache_read(0.14, 0.28, 0.0028)
+    };
+
+    let Some(ts) = ts else {
+        return deepseek_tod_rates(is_pro, false);
+    };
+    let Some(cutover) = deepseek_cutover() else {
+        return old;
+    };
+    if *ts < cutover {
+        old
+    } else {
+        deepseek_tod_rates(is_pro, deepseek_is_peak_hour(ts))
+    }
+}
+
 pub fn calculate_cost(
     model: &str,
     provider: &str,
@@ -142,6 +220,7 @@ pub fn calculate_cost(
     output_tokens: i64,
     cache_read_tokens: i64,
     cache_write_tokens: i64,
+    recorded_at: Option<&str>,
 ) -> Option<f64> {
     // Manually set override always wins over any automatic estimate.
     if let Some(ov) = pricing_override(model) {
@@ -197,12 +276,14 @@ pub fn calculate_cost(
         }
     }
 
+    let ts = recorded_at.and_then(parse_recorded_at);
     calculate_cost_fallback(
         model,
         input_tokens,
         output_tokens,
         cache_read_tokens,
         cache_write_tokens,
+        ts.as_ref(),
     )
 }
 
@@ -253,6 +334,7 @@ pub fn price_record(record: &mut UsageRecord) -> bool {
         record.output_tokens,
         record.cache_read_tokens,
         record.cache_write_tokens,
+        Some(&record.recorded_at),
     ) {
         Some(cost) => {
             record.cost_usd = Some(cost);
@@ -287,7 +369,7 @@ fn rates_cache_read(input: f64, output: f64, cache_read: f64) -> FallbackRates {
     }
 }
 
-fn fallback_rates(model: &str) -> Option<FallbackRates> {
+fn fallback_rates(model: &str, ts: Option<&chrono::DateTime<chrono::Utc>>) -> Option<FallbackRates> {
     if model.contains("opus") {
         return Some(FallbackRates {
             input: 15.0,
@@ -343,14 +425,14 @@ fn fallback_rates(model: &str) -> Option<FallbackRates> {
         return Some(rates_no_cache(2.0, 8.0));
     }
     if model.contains("deepseek-v4-pro") {
-        return Some(rates_cache_read(0.435, 0.87, 0.003625));
+        return Some(deepseek_rates(true, ts));
     }
     if model.contains("deepseek") {
         // deepseek-chat/deepseek-reasoner were retired 2026-07-24 and now map
         // to v4-flash. "free" tiers (e.g. deepseek-v4-flash-free on OpenCode
         // Zen) are the same model: we price them at v4-flash list rates as the
         // estimated value of usage rather than showing $0.
-        return Some(rates_cache_read(0.14, 0.28, 0.0028));
+        return Some(deepseek_rates(false, ts));
     }
     if model.contains("gemini-2.5-flash") || model.contains("gemini-3-flash") {
         return Some(rates_no_cache(0.30, 2.50));
@@ -390,8 +472,9 @@ fn calculate_cost_fallback(
     output_tokens: i64,
     cache_read_tokens: i64,
     cache_write_tokens: i64,
+    ts: Option<&chrono::DateTime<chrono::Utc>>,
 ) -> Option<f64> {
-    let rates = fallback_rates(model)?;
+    let rates = fallback_rates(model, ts)?;
 
     let per_mtok = |tokens: i64, rate: f64| (tokens as f64 / 1_000_000.0) * rate;
     let cost = per_mtok(input_tokens, rates.input)
@@ -461,6 +544,7 @@ mod fallback_tests {
             1_000_000,
             1_000_000,
             1_000_000,
+            None,
         )
         .unwrap();
         assert!((cost - 110.25).abs() < 1e-9);
@@ -468,7 +552,7 @@ mod fallback_tests {
 
     #[test]
     fn gpt_4o1_preview_is_not_priced_as_o1() {
-        let priced = calculate_cost_fallback("gpt-4o1-preview", 1_000_000, 0, 0, 0);
+        let priced = calculate_cost_fallback("gpt-4o1-preview", 1_000_000, 0, 0, 0, None);
         if let Some(c) = priced {
             assert!((c - 15.0).abs() > 1e-6, "mispriced");
         }
@@ -476,20 +560,20 @@ mod fallback_tests {
 
     #[test]
     fn unknown_model_returns_none() {
-        assert!(calculate_cost_fallback("totally-unknown", 1, 1, 0, 0).is_none());
+        assert!(calculate_cost_fallback("totally-unknown", 1, 1, 0, 0, None).is_none());
     }
 
     #[test]
     fn gpt_5_family_has_pricing() {
-        let c = calculate_cost_fallback("gpt-5", 1_000_000, 0, 0, 0).unwrap();
+        let c = calculate_cost_fallback("gpt-5", 1_000_000, 0, 0, 0, None).unwrap();
         assert!((c - 1.25).abs() < 1e-9);
-        let m = calculate_cost_fallback("gpt-5-mini", 1_000_000, 0, 0, 0).unwrap();
+        let m = calculate_cost_fallback("gpt-5-mini", 1_000_000, 0, 0, 0, None).unwrap();
         assert!((m - 0.25).abs() < 1e-9);
     }
 
     #[test]
     fn gemini_3_family_has_pricing() {
-        let c = calculate_cost_fallback("gemini-3-flash", 1_000_000, 0, 0, 0).unwrap();
+        let c = calculate_cost_fallback("gemini-3-flash", 1_000_000, 0, 0, 0, None).unwrap();
         assert!((c - 0.30).abs() < 1e-9);
     }
 
@@ -516,14 +600,94 @@ mod fallback_tests {
 
     #[test]
     fn free_deepseek_alias_prices_at_v4_flash_rates() {
-        let c = calculate_cost_fallback("deepseek-v4-flash-free", 1_000_000, 0, 0, 0).unwrap();
+        let pre_cutover = parse_recorded_at("2026-08-15").unwrap();
+        let ts = Some(&pre_cutover);
+        let c = calculate_cost_fallback("deepseek-v4-flash-free", 1_000_000, 0, 0, 0, ts).unwrap();
         assert!((c - 0.14).abs() < 1e-9);
-        let c = calculate_cost_fallback("deepseek-chat", 1_000_000, 0, 0, 0).unwrap();
+        let c = calculate_cost_fallback("deepseek-chat", 1_000_000, 0, 0, 0, ts).unwrap();
         assert!((c - 0.14).abs() < 1e-9);
-        let cache = calculate_cost_fallback("deepseek-v4-flash-free", 0, 0, 1_000_000, 0).unwrap();
+        let cache = calculate_cost_fallback("deepseek-v4-flash-free", 0, 0, 1_000_000, 0, ts).unwrap();
         assert!((cache - 0.0028).abs() < 1e-9);
-        let pro = calculate_cost_fallback("deepseek-v4-pro", 1_000_000, 0, 0, 0).unwrap();
+        let pro = calculate_cost_fallback("deepseek-v4-pro", 1_000_000, 0, 0, 0, ts).unwrap();
         assert!((pro - 0.435).abs() < 1e-9);
+    }
+
+    #[test]
+    fn deepseek_pre_cutover_keeps_old_flat_rates() {
+        let ts = parse_recorded_at("2026-08-16T15:59:59Z").unwrap();
+        let flash =
+            calculate_cost_fallback("deepseek-v4-flash-free", 1_000_000, 0, 0, 0, Some(&ts)).unwrap();
+        assert!((flash - 0.14).abs() < 1e-9);
+        let pro = calculate_cost_fallback("deepseek-v4-pro", 1_000_000, 0, 0, 0, Some(&ts)).unwrap();
+        assert!((pro - 0.435).abs() < 1e-9);
+    }
+
+    #[test]
+    fn deepseek_post_cutover_off_peak_uses_half_rates() {
+        let ts = parse_recorded_at("2026-08-17T05:00:00Z").unwrap();
+        let flash =
+            calculate_cost_fallback("deepseek-v4-flash-free", 1_000_000, 1_000_000, 1_000_000, 0, Some(&ts))
+                .unwrap();
+        assert!((flash - 0.887).abs() < 1e-9, "flash off-peak: {flash}");
+        let pro = calculate_cost_fallback("deepseek-v4-pro", 1_000_000, 1_000_000, 1_000_000, 0, Some(&ts))
+            .unwrap();
+        assert!((pro - 2.662).abs() < 1e-9, "pro off-peak: {pro}");
+    }
+
+    #[test]
+    fn deepseek_post_cutover_peak_uses_double_rates() {
+        let ts = parse_recorded_at("2026-08-17T08:00:00Z").unwrap();
+        let flash =
+            calculate_cost_fallback("deepseek-v4-flash-free", 1_000_000, 1_000_000, 1_000_000, 0, Some(&ts))
+                .unwrap();
+        assert!((flash - 1.774).abs() < 1e-9, "flash peak: {flash}");
+        let pro = calculate_cost_fallback("deepseek-v4-pro", 1_000_000, 1_000_000, 1_000_000, 0, Some(&ts))
+            .unwrap();
+        assert!((pro - 5.324).abs() < 1e-9, "pro peak: {pro}");
+    }
+
+    #[test]
+    fn deepseek_cutover_boundary_is_post_cutover() {
+        let ts = parse_recorded_at("2026-08-16T16:00:00Z").unwrap();
+        let flash =
+            calculate_cost_fallback("deepseek-v4-flash-free", 1_000_000, 0, 0, 0, Some(&ts)).unwrap();
+        assert!((flash - 0.22).abs() < 1e-9, "hour 16 is off-peak: {flash}");
+    }
+
+    #[test]
+    fn deepseek_peak_window_boundaries() {
+        let cases = [
+            ("2026-08-17T00:00:00Z", false),
+            ("2026-08-17T01:00:00Z", true),
+            ("2026-08-17T03:59:59Z", true),
+            ("2026-08-17T04:00:00Z", false),
+            ("2026-08-17T05:59:59Z", false),
+            ("2026-08-17T06:00:00Z", true),
+            ("2026-08-17T09:59:59Z", true),
+            ("2026-08-17T10:00:00Z", false),
+        ];
+        for (ts, peak) in cases {
+            let dt = parse_recorded_at(ts).unwrap();
+            assert_eq!(deepseek_is_peak_hour(&dt), peak, "ts={ts}");
+        }
+    }
+
+    #[test]
+    fn deepseek_without_timestamp_prices_at_off_peak_list() {
+        let flash = calculate_cost_fallback("deepseek-v4-flash-free", 1_000_000, 0, 0, 0, None).unwrap();
+        assert!((flash - 0.22).abs() < 1e-9);
+    }
+
+    #[test]
+    fn non_deepseek_models_unaffected_by_timestamp() {
+        let no_ts =
+            calculate_cost_fallback("claude-opus-4-20250514", 1_000_000, 1_000_000, 1_000_000, 1_000_000, None)
+                .unwrap();
+        let pre = parse_recorded_at("2026-08-15").unwrap();
+        let with_ts =
+            calculate_cost_fallback("claude-opus-4-20250514", 1_000_000, 1_000_000, 1_000_000, 1_000_000, Some(&pre))
+                .unwrap();
+        assert_eq!(no_ts, with_ts);
     }
 
     #[test]

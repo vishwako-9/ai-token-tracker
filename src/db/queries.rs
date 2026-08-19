@@ -138,7 +138,9 @@ pub fn recompute_missing_costs(conn: &Connection) -> Result<usize> {
 
 /// Recompute cost for every record from current rates, overwriting stored
 /// values. Use after `update-pricing` so historical rows reflect price
-/// changes rather than keeping stale numbers.
+/// changes rather than keeping stale numbers. Models priced on time-of-day
+/// rates (e.g. DeepSeek post-2026-08-16) are priced at each record's own
+/// `recorded_at`, so pre-cutover rows keep their old flat-rate cost.
 pub fn recompute_all_costs(conn: &Connection) -> Result<usize> {
     apply_pricing(conn, "")
 }
@@ -146,7 +148,8 @@ pub fn recompute_all_costs(conn: &Connection) -> Result<usize> {
 fn apply_pricing(conn: &Connection, where_clause: &str) -> Result<usize> {
     let sql = format!(
         "SELECT id, provider, model, input_tokens, output_tokens,
-                cache_read_tokens, cache_write_tokens, reasoning_tokens
+                cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                recorded_at
          FROM usage_records {}",
         where_clause
     );
@@ -164,7 +167,7 @@ let mut stmt = conn.prepare(&sql)?;
                 reasoning_tokens: row.get(7)?,
                 cost_usd: None,
                 session_id: None,
-                recorded_at: String::new(),
+                recorded_at: row.get(8)?,
                 collected_at: String::new(),
                 metadata: None,
             })
