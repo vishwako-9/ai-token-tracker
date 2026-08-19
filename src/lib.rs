@@ -4,3 +4,4 @@ pub mod costs;
 pub mod db;
 pub mod display;
 pub mod models;
+pub mod price_watch;

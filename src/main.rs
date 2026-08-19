@@ -4,6 +4,7 @@ mod costs;
 mod db;
 mod display;
 mod models;
+mod price_watch;
 mod server;
 mod theme;
 mod tui;
@@ -170,6 +171,9 @@ enum Commands {
         #[arg(long)]
         unpriced: bool,
     },
+    /// Check whether watched provider pricing pages have changed since the
+    /// last check (change detection only — no parsing)
+    PriceCheck,
     /// Count Antigravity requests per model/day (token usage unavailable)
     Antigravity {
         /// Number of days to look back (default: 30)
@@ -563,6 +567,9 @@ fn main() -> Result<()> {
                         }
                     }
                 }
+            }
+            Commands::PriceCheck => {
+                price_watch::price_check().await?;
             }
             Commands::Antigravity { days, json } => {
                 let collector = collectors::antigravity::AntigravityCollector::new(
