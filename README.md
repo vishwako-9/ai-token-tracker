@@ -6,7 +6,7 @@ Local-first AI coding token usage and cost tracker.
 
 - [Rust](https://www.rust-lang.org/) and [Cargo](https://cargo.rust-lang.org/)
 - Minimum version: `edition = "2021"` (per `Cargo.toml`)
-- No external database needed — everything uses a bundled SQLite library
+- No external database needed. Everything uses a bundled SQLite library
 
 ## Build & Install
 
@@ -57,7 +57,7 @@ Run `tokentracker tui` to enter the interactive terminal interface.
 
 ## Local-First
 
-All data is stored in a local SQLite database — **no data leaves the machine**. The optional `update-pricing` command fetches current model pricing from LiteLLM for cost estimation, but all usage records remain on your machine.
+All data is stored in a local SQLite database. **No data leaves the machine.** The optional `update-pricing` command fetches current model pricing from LiteLLM for cost estimation, but all usage records remain on your machine.
 
 ## License
 
