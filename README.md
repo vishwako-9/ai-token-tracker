@@ -1,4 +1,4 @@
-# tokentracker-cli
+# ai-token-tracker
 
 Local-first AI coding token usage and cost tracker.
 

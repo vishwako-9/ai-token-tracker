@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Local-first AI coding token usage and cost tracker (Claude Code, OpenCode, Codex, Gemini CLI, Antigravity, Ollama)"
 license = "MIT"
-repository = "https://github.com/example/tokentracker-cli"
+repository = "https://github.com/vishwako-9/ai-token-tracker"
 
 [[bin]]
 name = "tokentracker"
